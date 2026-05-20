@@ -45,6 +45,76 @@ Examples:
 EOF
 }
 
+INSTALLER_SELF_UPDATE_URL="${INSTALLER_SELF_UPDATE_URL:-https://raw.githubusercontent.com/Xandeum/xandminer-installer/refs/heads/master/install.sh}"
+
+auto_update_installer() {
+    if [ "${XANDEUM_INSTALLER_SELF_UPDATED:-}" = "1" ] || [ "${XANDEUM_INSTALLER_SKIP_SELF_UPDATE:-}" = "1" ]; then
+        return 0
+    fi
+
+    local script_path="$0"
+    local tmp_file
+
+    tmp_file=$(mktemp /tmp/xandeum-installer.XXXXXX) || {
+        echo "Error: Could not create a temporary file for installer self-update."
+        exit 1
+    }
+
+    echo "Checking for latest installer script..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$INSTALLER_SELF_UPDATE_URL" -o "$tmp_file" || {
+            echo "Error: Could not download latest installer script from $INSTALLER_SELF_UPDATE_URL"
+            rm -f "$tmp_file"
+            exit 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_file" "$INSTALLER_SELF_UPDATE_URL" || {
+            echo "Error: Could not download latest installer script from $INSTALLER_SELF_UPDATE_URL"
+            rm -f "$tmp_file"
+            exit 1
+        }
+    else
+        echo "Error: curl or wget is required to update the installer before running."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if ! head -n 1 "$tmp_file" | grep -qx '#!/bin/bash'; then
+        echo "Error: Downloaded installer script does not look like a valid installer. Aborting."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if ! bash -n "$tmp_file"; then
+        echo "Error: Downloaded installer script failed syntax validation. Aborting."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if [ -f "$script_path" ] && cmp -s "$tmp_file" "$script_path" 2>/dev/null; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    if [ -f "$script_path" ] && [ -w "$script_path" ]; then
+        echo "Updating installer script to latest version..."
+        cp "$tmp_file" "$script_path" || {
+            echo "Error: Could not update installer script at $script_path"
+            rm -f "$tmp_file"
+            exit 1
+        }
+        chmod +x "$script_path" 2>/dev/null || true
+        rm -f "$tmp_file"
+        XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$script_path" "$@"
+    fi
+
+    echo "Running latest installer script from temporary copy..."
+    chmod +x "$tmp_file" 2>/dev/null || true
+    XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$tmp_file" "$@"
+}
+
+auto_update_installer "$@"
+
 # Command-line arguments
 NON_INTERACTIVE=false
 USE_DEFAULT_KEYPAIR=false
