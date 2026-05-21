@@ -10,7 +10,7 @@ Options:
   -n, --non-interactive    Run in non-interactive mode (requires --install or --update)
   --install                Perform fresh installation
   --update                 Update existing installation
-  -d, --dev                Enable dev mode (interactive branch selection for repos and pod trynet versions)
+  -d, --dev                Enable dev mode (interactive branch selection for repos and pod test-network versions)
   --default-keypair        Use default keypair path (/local/keypairs/pnode-keypair.json)
   --keypair-path PATH      Specify custom keypair path
   --generate-keypair       Generate a new pNode keypair after fresh install
@@ -45,6 +45,76 @@ Examples:
 EOF
 }
 
+INSTALLER_SELF_UPDATE_URL="${INSTALLER_SELF_UPDATE_URL:-https://raw.githubusercontent.com/Xandeum/xandminer-installer/refs/heads/master/install.sh}"
+
+auto_update_installer() {
+    if [ "${XANDEUM_INSTALLER_SELF_UPDATED:-}" = "1" ] || [ "${XANDEUM_INSTALLER_SKIP_SELF_UPDATE:-}" = "1" ]; then
+        return 0
+    fi
+
+    local script_path="$0"
+    local tmp_file
+
+    tmp_file=$(mktemp /tmp/xandeum-installer.XXXXXX) || {
+        echo "Error: Could not create a temporary file for installer self-update."
+        exit 1
+    }
+
+    echo "Checking for latest installer script..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$INSTALLER_SELF_UPDATE_URL" -o "$tmp_file" || {
+            echo "Error: Could not download latest installer script from $INSTALLER_SELF_UPDATE_URL"
+            rm -f "$tmp_file"
+            exit 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_file" "$INSTALLER_SELF_UPDATE_URL" || {
+            echo "Error: Could not download latest installer script from $INSTALLER_SELF_UPDATE_URL"
+            rm -f "$tmp_file"
+            exit 1
+        }
+    else
+        echo "Error: curl or wget is required to update the installer before running."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if ! head -n 1 "$tmp_file" | grep -qx '#!/bin/bash'; then
+        echo "Error: Downloaded installer script does not look like a valid installer. Aborting."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if ! bash -n "$tmp_file"; then
+        echo "Error: Downloaded installer script failed syntax validation. Aborting."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if [ -f "$script_path" ] && cmp -s "$tmp_file" "$script_path" 2>/dev/null; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    if [ -f "$script_path" ] && [ -w "$script_path" ]; then
+        echo "Updating installer script to latest version..."
+        cp "$tmp_file" "$script_path" || {
+            echo "Error: Could not update installer script at $script_path"
+            rm -f "$tmp_file"
+            exit 1
+        }
+        chmod +x "$script_path" 2>/dev/null || true
+        rm -f "$tmp_file"
+        XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$script_path" "$@"
+    fi
+
+    echo "Running latest installer script from temporary copy..."
+    chmod +x "$tmp_file" 2>/dev/null || true
+    XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$tmp_file" "$@"
+}
+
+auto_update_installer "$@"
+
 # Command-line arguments
 NON_INTERACTIVE=false
 USE_DEFAULT_KEYPAIR=false
@@ -56,6 +126,9 @@ OPERATOR_REVENUE=""
 POD_LOG_PATH=""
 INSTALL_OPTION=""
 DEV_MODE=false
+POD_STABLE_REPO_URL="https://xandeum.github.io/pod-apt-package/"
+POD_TRYNET_REPO_URL="https://raw.githubusercontent.com/Xandeum/trynet-packages/main/"
+POD_DEVNET_REPO_URL="https://raw.githubusercontent.com/Xandeum/devnet-packages/main/"
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -610,6 +683,104 @@ handle_pod_log_path() {
     export POD_LOG_PATH
 }
 
+get_pod_repo_kind() {
+    if [ "$DEV_MODE" = true ]; then
+        case "$ATLAS_CLUSTER" in
+            trynet)
+                echo "trynet"
+                ;;
+            devnet)
+                echo "devnet"
+                ;;
+            *)
+                echo "stable"
+                ;;
+        esac
+    else
+        echo "stable"
+    fi
+}
+
+get_pod_repo_name() {
+    case "$1" in
+        trynet)
+            echo "Trynet"
+            ;;
+        devnet)
+            echo "Devnet"
+            ;;
+        *)
+            echo "stable"
+            ;;
+    esac
+}
+
+get_pod_repo_url() {
+    case "$1" in
+        trynet)
+            echo "$POD_TRYNET_REPO_URL"
+            ;;
+        devnet)
+            echo "$POD_DEVNET_REPO_URL"
+            ;;
+        *)
+            echo "$POD_STABLE_REPO_URL"
+            ;;
+    esac
+}
+
+get_pod_repo_list_file() {
+    case "$1" in
+        trynet)
+            echo "/etc/apt/sources.list.d/xandeum-pod-trynet.list"
+            ;;
+        devnet)
+            echo "/etc/apt/sources.list.d/xandeum-pod-devnet.list"
+            ;;
+        *)
+            echo "/etc/apt/sources.list.d/xandeum-pod.list"
+            ;;
+    esac
+}
+
+configure_pod_apt_repository() {
+    local repo_kind="$1"
+    local repo_name
+    local repo_url
+    local list_file
+
+    repo_name=$(get_pod_repo_name "$repo_kind")
+    repo_url=$(get_pod_repo_url "$repo_kind")
+    list_file=$(get_pod_repo_list_file "$repo_kind")
+
+    echo "Configuring $repo_name pod repository: $repo_url" >&2
+    sudo rm -f /etc/apt/sources.list.d/xandeum-pod.list \
+        /etc/apt/sources.list.d/xandeum-pod-trynet.list \
+        /etc/apt/sources.list.d/xandeum-pod-devnet.list
+    echo "deb [trusted=yes] $repo_url stable main" | sudo tee "$list_file" >/dev/null
+}
+
+list_pod_versions_from_repo() {
+    local repo_kind="$1"
+    local repo_url
+    local versions
+
+    repo_url=$(get_pod_repo_url "$repo_kind")
+    versions=$(apt-cache madison pod 2>/dev/null | grep -F "$repo_url" | awk '{print $3}')
+
+    if [ -z "$versions" ] && [ "$repo_kind" != "stable" ]; then
+        versions=$(apt-cache madison pod 2>/dev/null | grep -F "$repo_kind" | awk '{print $3}')
+    fi
+
+    if [ -n "$versions" ]; then
+        printf '%s\n' "$versions"
+    fi
+}
+
+get_latest_pod_version_from_repo() {
+    list_pod_versions_from_repo "$1" | head -1
+}
+
 select_branch() {
     local REPO_NAME=$1
     local REPO_URL=$2
@@ -680,31 +851,42 @@ select_branch() {
 }
 
 select_pod_version() {
+    local repo_kind="$1"
+    local repo_name
+    local repo_token
+
+    repo_name=$(get_pod_repo_name "$repo_kind")
+    repo_token="$repo_kind"
+
+    if [ "$repo_kind" = "stable" ]; then
+        echo "latest"
+        return 0
+    fi
+
     # All output to stderr for visibility during command substitution
     echo "" >&2
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-    echo "  Trynet Pod Version Selection" >&2
+    echo "  $repo_name Pod Version Selection" >&2
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
     echo "" >&2
-    echo "Adding trynet repository..." >&2
+    echo "Adding $repo_name repository..." >&2
     
-    # Add trynet repository
-    echo "deb [trusted=yes] https://raw.githubusercontent.com/Xandeum/trynet-packages/main/ stable main" | tee /etc/apt/sources.list.d/xandeum-pod-trynet.list >/dev/null
+    configure_pod_apt_repository "$repo_kind"
     apt-get update --allow-releaseinfo-change -y >/dev/null 2>&1
     
-    echo "Fetching available trynet versions..." >&2
+    echo "Fetching available $repo_name versions..." >&2
     echo "" >&2
     
-    # Get trynet versions and format them
-    apt-cache madison pod 2>/dev/null | grep trynet | head -10 | awk '{print $3}' > /tmp/pod_versions_$$.txt
+    # Get selected repository versions and format them
+    list_pod_versions_from_repo "$repo_kind" | head -10 > /tmp/pod_versions_$$.txt
     
     if [ ! -s /tmp/pod_versions_$$.txt ]; then
-        echo "Error: Could not fetch trynet versions. Using latest stable." >&2
-        echo "stable"
+        echo "Error: Could not fetch $repo_name versions. Using latest $repo_name package." >&2
+        echo "latest"
         return 0
     fi
     
-    echo "Available trynet pod versions (10 most recent):" >&2
+    echo "Available $repo_name pod versions (10 most recent):" >&2
     echo "" >&2
     
     # Display versions with numbers
@@ -713,9 +895,9 @@ select_pod_version() {
     
     while read -r version; do
         VERSION_ARRAY[$counter]="$version"
-        # Extract timestamp and commit from version string
-        # Format: 0.4.2~trynet.20251126115954.bedda09-1
-        local timestamp=$(echo "$version" | grep -oP '(?<=trynet\.)\d{14}' | sed 's/\(.\{4\}\)\(.\{2\}\)\(.\{2\}\)/\1-\2-\3/')
+        # Extract timestamp and commit from versions like:
+        # 0.4.2~trynet.20251126115954.bedda09-1
+        local timestamp=$(echo "$version" | grep -oP "${repo_token}\.\K\d{14}" | sed 's/\(.\{4\}\)\(.\{2\}\)\(.\{2\}\)/\1-\2-\3/')
         local commit=$(echo "$version" | grep -oP '[a-f0-9]{7}(?=-1)' | head -1)
         
         printf "%2d. %-50s %s  %s\n" "$counter" "$version" "$timestamp" "$commit" >&2
@@ -729,12 +911,12 @@ select_pod_version() {
     
     # Prompt for selection
     while true; do
-        read -p "Select version number (1-10), enter custom version, or press Enter for latest stable: " VERSION_CHOICE >&2
+        read -p "Select version number (1-10), enter custom version, or press Enter for latest $repo_name: " VERSION_CHOICE >&2
         
-        # Empty = use stable
+        # Empty = use latest from the selected repository
         if [ -z "$VERSION_CHOICE" ]; then
-            echo "Using latest stable version" >&2
-            echo "stable"
+            echo "Using latest $repo_name version" >&2
+            echo "latest"
             return 0
         # Check if input is a number
         elif [[ "$VERSION_CHOICE" =~ ^[0-9]+$ ]] && [ "$VERSION_CHOICE" -ge 1 ] && [ "$VERSION_CHOICE" -lt "$counter" ]; then
@@ -792,21 +974,24 @@ start_install() {
         # Select branch for xandminerd
         XANDMINERD_BRANCH=$(select_branch "xandminerd" "https://github.com/Xandeum/xandminerd.git")
         
-        # Select pod trynet version
-        POD_VERSION=$(select_pod_version)
+        # Select pod version from the repository that matches the Atlas cluster.
+        POD_REPO_KIND=$(get_pod_repo_kind)
+        POD_VERSION=$(select_pod_version "$POD_REPO_KIND")
         
         echo ""
         echo "Selected branches:"
         echo "  xandminer: $XANDMINER_BRANCH"
         echo "  xandminerd: $XANDMINERD_BRANCH"
+        echo "  pod repository: $(get_pod_repo_name "$POD_REPO_KIND")"
         echo "  pod: $POD_VERSION"
         echo ""
     elif [ "$DEV_MODE" = true ] && [ "$NON_INTERACTIVE" = true ]; then
         # Non-interactive dev mode - use defaults
-        echo "Dev mode enabled in non-interactive mode - using default branches"
+        POD_REPO_KIND=$(get_pod_repo_kind)
+        echo "Dev mode enabled in non-interactive mode - using default branches and $(get_pod_repo_name "$POD_REPO_KIND") pod repository"
         XANDMINER_BRANCH="main"
         XANDMINERD_BRANCH="main"
-        POD_VERSION="stable"
+        POD_VERSION="latest"
     fi
 
     if [ -d "xandminer" ] && [ -d "xandminerd" ]; then
@@ -1002,41 +1187,39 @@ restart_service() {
 install_pod() {
     sudo apt-get install -y apt-transport-https ca-certificates
 
-    # Remove trynet repository if it exists (only use in dev mode)
-    if [ "$DEV_MODE" != true ] && [ -f /etc/apt/sources.list.d/xandeum-pod-trynet.list ]; then
-        echo "Removing trynet repository (not in dev mode)..."
-        sudo rm -f /etc/apt/sources.list.d/xandeum-pod-trynet.list
-        # Clear apt cache to remove trynet packages
-        sudo apt-get clean
-    fi
+    local pod_repo_kind
+    local pod_repo_name
+    local latest_pod_version
 
-    echo "deb [trusted=yes] https://xandeum.github.io/pod-apt-package/ stable main" | sudo tee /etc/apt/sources.list.d/xandeum-pod.list
+    pod_repo_kind=$(get_pod_repo_kind)
+    pod_repo_name=$(get_pod_repo_name "$pod_repo_kind")
+    configure_pod_apt_repository "$pod_repo_kind"
+    sudo apt-get clean
 
     sudo apt-get update --allow-releaseinfo-change -y
 
     # Install pod (version depends on installation mode)
-    if [ "$DEV_MODE" = true ] && [ -n "$POD_VERSION" ] && [ "$POD_VERSION" != "stable" ]; then
-        echo "Installing trynet pod version: $POD_VERSION"
+    if [ "$DEV_MODE" = true ] && [ -n "$POD_VERSION" ] && [ "$POD_VERSION" != "stable" ] && [ "$POD_VERSION" != "latest" ]; then
+        echo "Installing $pod_repo_name pod version: $POD_VERSION"
         echo "⚠️  Note: This may downgrade from a newer stable version"
         sudo apt-get install -y --allow-downgrades pod=$POD_VERSION
     else
-        echo "Installing latest stable pod version"
-        # Check if pod is already installed with trynet version
+        echo "Installing latest $pod_repo_name pod version"
+        # Check if pod is already installed with a test-network version.
         CURRENT_POD_VERSION=$(pod --version 2>/dev/null || echo "")
-        if [[ "$CURRENT_POD_VERSION" == *"trynet"* ]]; then
-            echo "⚠️  Detected trynet version installed. Removing to install stable version..."
+        if [ "$pod_repo_kind" = "stable" ] && [[ "$CURRENT_POD_VERSION" == *"trynet"* || "$CURRENT_POD_VERSION" == *"devnet"* ]]; then
+            echo "⚠️  Detected test-network version installed. Removing to install stable version..."
             sudo systemctl stop pod.service 2>/dev/null || true
             sudo apt-get remove -y pod 2>/dev/null || true
         fi
         
-        # Explicitly install from stable repository, ignoring trynet versions
-        # First, try to get the stable version explicitly
-        STABLE_VERSION=$(apt-cache madison pod 2>/dev/null | grep -v trynet | grep "https://xandeum.github.io" | head -1 | awk '{print $3}')
-        if [ -n "$STABLE_VERSION" ]; then
-            echo "Installing stable version: $STABLE_VERSION"
-            sudo apt-get install -y --allow-downgrades pod=$STABLE_VERSION
+        # Explicitly install from the configured repository.
+        latest_pod_version=$(get_latest_pod_version_from_repo "$pod_repo_kind")
+        if [ -n "$latest_pod_version" ]; then
+            echo "Installing $pod_repo_name version: $latest_pod_version"
+            sudo apt-get install -y --allow-downgrades pod=$latest_pod_version
         else
-            # Fallback: install latest (should be stable if trynet repo is removed)
+            # Fallback: install latest from the configured source list.
             sudo apt-get install -y pod
         fi
     fi
