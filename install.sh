@@ -684,21 +684,17 @@ handle_pod_log_path() {
 }
 
 get_pod_repo_kind() {
-    if [ "$DEV_MODE" = true ]; then
-        case "$ATLAS_CLUSTER" in
-            trynet)
-                echo "trynet"
-                ;;
-            devnet)
-                echo "devnet"
-                ;;
-            *)
-                echo "stable"
-                ;;
-        esac
-    else
-        echo "stable"
-    fi
+    case "$ATLAS_CLUSTER" in
+        trynet)
+            echo "trynet"
+            ;;
+        devnet)
+            echo "devnet"
+            ;;
+        *)
+            echo "stable"
+            ;;
+    esac
 }
 
 get_pod_repo_name() {
