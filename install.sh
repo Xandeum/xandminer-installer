@@ -744,16 +744,18 @@ configure_pod_apt_repository() {
     local repo_name
     local repo_url
     local list_file
+    local apt_arch
 
     repo_name=$(get_pod_repo_name "$repo_kind")
     repo_url=$(get_pod_repo_url "$repo_kind")
     list_file=$(get_pod_repo_list_file "$repo_kind")
+    apt_arch=$(dpkg --print-architecture)
 
     echo "Configuring $repo_name pod repository: $repo_url" >&2
     sudo rm -f /etc/apt/sources.list.d/xandeum-pod.list \
         /etc/apt/sources.list.d/xandeum-pod-trynet.list \
         /etc/apt/sources.list.d/xandeum-pod-devnet.list
-    echo "deb [trusted=yes] $repo_url stable main" | sudo tee "$list_file" >/dev/null
+    echo "deb [trusted=yes arch=$apt_arch] $repo_url stable main" | sudo tee "$list_file" >/dev/null
 }
 
 list_pod_versions_from_repo() {
