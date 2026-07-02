@@ -112,8 +112,8 @@ auto_update_installer() {
     chmod +x "$tmp_file" 2>/dev/null || true
     XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$tmp_file" "$@"
 }
-
-# auto_update_installer "$@"
+# Auto updates the script every time it runs
+auto_update_installer "$@"
 
 # Command-line arguments
 NON_INTERACTIVE=false
