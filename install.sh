@@ -113,7 +113,7 @@ auto_update_installer() {
     XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$tmp_file" "$@"
 }
 
-auto_update_installer "$@"
+# auto_update_installer "$@"
 
 # Command-line arguments
 NON_INTERACTIVE=false
@@ -236,8 +236,9 @@ show_menu() {
     echo "2. Update Xandeum pNode Software"
     echo "3. Stop/Restart/Disable Service"
     echo "4. Harden SSH (Disable Password Login)"
-    echo "5. Exit"
-    read -p "Enter your choice (1-5): " choice
+    echo "5. Diagnostics (Read-Only)"
+    echo "6. Exit"
+    read -p "Enter your choice (1-6): " choice
     case $choice in
     1)
         INSTALL_OPTION="1"
@@ -249,7 +250,8 @@ show_menu() {
         ;;
     3) actions ;;
     4) harden_ssh ;;
-    5)
+    5) diagnostics_menu ;;
+    6)
         echo "Exiting..."
         exit 0
         ;;
@@ -266,6 +268,161 @@ sudoCheck() {
         echo "This script must be run as root or with sudo. Please try again with sudo."
         exit 1
     fi
+}
+
+diagnostics_menu() {
+    echo ""
+    echo "Installer Diagnostics"
+    echo "Read-only initial release: reports state only and does not change firewall rules, apt sources, or services."
+    echo ""
+    echo "1. Firewall/UFW Report"
+    echo "2. Previous Menu"
+    read -p "Enter your choice (1-2): " choice
+    case $choice in
+    1)
+        firewall_ufw_report
+        echo ""
+        read -p "Press Enter to return to Diagnostics..."
+        diagnostics_menu
+        ;;
+    2)
+        show_menu
+        ;;
+    *)
+        echo "Invalid option. Please try again."
+        diagnostics_menu
+        ;;
+    esac
+}
+
+detect_configured_ssh_port() {
+    local port=""
+    local cfg
+
+    if command -v sshd >/dev/null 2>&1; then
+        port=$(sshd -T 2>/dev/null | sed -n 's/^port //p' | head -1)
+    fi
+
+    if [ -z "$port" ]; then
+        for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+            [ -f "$cfg" ] || continue
+            port=$(sed -n 's/^[[:space:]]*Port[[:space:]]\+\([0-9][0-9]*\).*$/\1/p' "$cfg" | tail -1)
+            [ -n "$port" ] && break
+        done
+    fi
+
+    echo "${port:-22}"
+}
+
+ufw_rule_present() {
+    local pattern="$1"
+    printf '%s\n' "$UFW_STATUS_VERBOSE" | grep -Eiq "$pattern"
+}
+
+add_firewall_rule_check() {
+    local label="$1"
+    local pattern="$2"
+    local command_hint="$3"
+
+    if ufw_rule_present "$pattern"; then
+        printf '  [PASS] %-36s present\n' "$label"
+    else
+        printf '  [WARN] %-36s missing\n' "$label"
+        FIREWALL_MISSING_COMMANDS+=("$command_hint")
+    fi
+}
+
+add_firewall_ssh_check() {
+    local ssh_port="$1"
+    local limit_pattern="^(${ssh_port}/tcp|OpenSSH)[[:space:]]+LIMIT IN([[:space:]]|$)"
+    local allow_pattern="^(${ssh_port}/tcp|OpenSSH)[[:space:]]+ALLOW IN([[:space:]]|$)"
+
+    if ufw_rule_present "$limit_pattern"; then
+        printf '  [PASS] %-36s rate-limited\n' "SSH ${ssh_port}/tcp inbound"
+    elif ufw_rule_present "$allow_pattern"; then
+        printf '  [WARN] %-36s allowed, but not rate-limited\n' "SSH ${ssh_port}/tcp inbound"
+        FIREWALL_MISSING_COMMANDS+=("sudo ufw limit ${ssh_port}/tcp comment 'SSH access with UFW rate limiting'")
+    else
+        printf '  [WARN] %-36s missing rate-limit rule\n' "SSH ${ssh_port}/tcp inbound"
+        FIREWALL_MISSING_COMMANDS+=("sudo ufw limit ${ssh_port}/tcp comment 'SSH access with UFW rate limiting'")
+    fi
+}
+
+firewall_ufw_report() {
+    local ssh_port
+    local ufw_status_rc
+
+    sudoCheck
+
+    echo ""
+    echo "================================================================="
+    echo "XANDEUM FIREWALL/UFW REPORT (READ-ONLY)"
+    echo "================================================================="
+    echo "This diagnostic does not run ufw allow, ufw limit, ufw enable, or ufw default."
+    echo ""
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        echo "[WARN] UFW is not installed."
+        echo "No firewall changes were made."
+        return 0
+    fi
+
+    UFW_STATUS_VERBOSE="$(ufw status verbose 2>&1)"
+    ufw_status_rc=$?
+    ssh_port="$(detect_configured_ssh_port)"
+    FIREWALL_MISSING_COMMANDS=()
+
+    if [ "$ufw_status_rc" -ne 0 ]; then
+        echo "[WARN] Could not read UFW status cleanly."
+        echo "$UFW_STATUS_VERBOSE"
+        echo "No firewall changes were made."
+        return 0
+    fi
+
+    if printf '%s\n' "$UFW_STATUS_VERBOSE" | grep -q '^Status: active'; then
+        echo "[PASS] UFW status: active"
+    else
+        echo "[WARN] UFW status is not active."
+    fi
+
+    if printf '%s\n' "$UFW_STATUS_VERBOSE" | grep -q '^Default:'; then
+        printf '[INFO] %s\n' "$(printf '%s\n' "$UFW_STATUS_VERBOSE" | grep '^Default:' | head -1)"
+    fi
+    echo "[INFO] SSH port inferred for this report: ${ssh_port}/tcp. Verify before changing firewall rules."
+    echo ""
+
+    echo "Current UFW status:"
+    echo "-----------------------------------------------------------------"
+    printf '%s\n' "$UFW_STATUS_VERBOSE"
+    echo "-----------------------------------------------------------------"
+    echo ""
+
+    echo "Expected Xandeum firewall profile:"
+    add_firewall_rule_check "5000/udp inbound Atlas" '^5000/udp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 5000/udp comment 'Atlas'"
+    add_firewall_rule_check "9001/udp inbound Gossip" '^9001/udp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 9001/udp comment 'Gossip inbound'"
+    add_firewall_rule_check "9001/udp outbound Gossip" '^9001/udp[[:space:]]+ALLOW OUT([[:space:]]|$)' "sudo ufw allow out 9001/udp comment 'Gossip outbound'"
+    add_firewall_rule_check "6000/tcp inbound pRPC" '^6000/tcp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 6000/tcp comment 'pRPC'"
+    add_firewall_rule_check "7000/tcp inbound Ingest/Tap" '^7000/tcp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 7000/tcp comment 'Ingest/Tap inbound'"
+    add_firewall_rule_check "7000/tcp outbound Ingest/Tap" '^7000/tcp[[:space:]]+ALLOW OUT([[:space:]]|$)' "sudo ufw allow out 7000/tcp comment 'Ingest/Tap outbound'"
+    add_firewall_rule_check "7001/udp outbound fanout" '^7001/udp[[:space:]]+ALLOW OUT([[:space:]]|$)' "sudo ufw allow out 7001/udp comment 'Outbound pod-to-pod fanout'"
+    add_firewall_rule_check "7002/udp inbound fanout" '^7002/udp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 7002/udp comment 'Inbound pod-to-pod fanout'"
+    add_firewall_ssh_check "$ssh_port"
+
+    echo ""
+    if [ "${#FIREWALL_MISSING_COMMANDS[@]}" -eq 0 ]; then
+        echo "[PASS] No missing Xandeum firewall rules detected."
+    else
+        echo "[WARN] Missing or incomplete firewall entries detected."
+        echo "Commands that would address the report, shown for review only:"
+        local command_hint
+        for command_hint in "${FIREWALL_MISSING_COMMANDS[@]}"; do
+            printf '  %s\n' "$command_hint"
+        done
+    fi
+
+    echo ""
+    echo "No firewall changes were made."
+    echo "================================================================="
 }
 
 harden_ssh() {
