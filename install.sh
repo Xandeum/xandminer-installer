@@ -112,8 +112,8 @@ auto_update_installer() {
     chmod +x "$tmp_file" 2>/dev/null || true
     XANDEUM_INSTALLER_SELF_UPDATED=1 exec bash "$tmp_file" "$@"
 }
-# Auto updates the script every time it runs
-auto_update_installer "$@"
+# Disabled while local installer diagnostics changes are under development.
+# auto_update_installer "$@"
 
 # Command-line arguments
 NON_INTERACTIVE=false
@@ -276,8 +276,9 @@ diagnostics_menu() {
     echo "Read-only initial release: reports state only and does not change firewall rules, apt sources, or services."
     echo ""
     echo "1. Firewall/UFW Report"
-    echo "2. Previous Menu"
-    read -p "Enter your choice (1-2): " choice
+    echo "2. Full Node Diagnostic (Local)"
+    echo "3. Previous Menu"
+    read -p "Enter your choice (1-3): " choice
     case $choice in
     1)
         firewall_ufw_report
@@ -286,6 +287,12 @@ diagnostics_menu() {
         diagnostics_menu
         ;;
     2)
+        run_check_node_diagnostic
+        echo ""
+        read -p "Press Enter to return to Diagnostics..."
+        diagnostics_menu
+        ;;
+    3)
         show_menu
         ;;
     *)
@@ -293,6 +300,740 @@ diagnostics_menu() {
         diagnostics_menu
         ;;
     esac
+}
+
+run_check_node_diagnostic() {
+    sudoCheck
+
+    DIAG_RPC_URL="http://localhost:6000/rpc"
+    DIAG_STATS=""
+    DIAG_PASS_COUNT=0
+    DIAG_INFO_COUNT=0
+    DIAG_WARN_COUNT=0
+    DIAG_FAIL_COUNT=0
+    DIAG_ERROR_COUNT=0
+    DIAG_ALERT_LINES=()
+    DIAG_PORT_CHECK_LINES=()
+    DIAG_PORT_EVIDENCE_LINES=()
+    DIAG_KNOWN_CONFLICT_LINES=()
+    DIAG_KNOWN_CONFLICT_EVIDENCE=()
+
+    echo ""
+    echo "================================================================="
+    echo "XANDEUM FULL NODE DIAGNOSTIC (READ-ONLY)"
+    echo "================================================================="
+    echo "Running local installer diagnostics with Atlas credits lookup skipped."
+    echo "This diagnostic does not restart services, edit files, change firewall rules, or install packages."
+    echo ""
+
+    if ! diag_have_cmd curl; then
+        diag_add_alert ERROR "curl is not installed; cannot query pod RPC"
+        diag_collect_required_port_checks "unreachable"
+        diag_collect_known_conflicts "unreachable"
+        diag_print_summary
+        echo "No diagnostic changes were made."
+        echo "================================================================="
+        return 0
+    fi
+
+    DIAG_STATS=$(curl -sS --max-time 5 -d '{"jsonrpc":"2.0","method":"get-stats","id":1}' -H "Content-Type: application/json" "$DIAG_RPC_URL" 2>/dev/null || true)
+
+    if [ -z "$DIAG_STATS" ]; then
+        diag_add_alert ERROR "Pod RPC unreachable at ${DIAG_RPC_URL}"
+        diag_collect_required_port_checks "unreachable"
+        diag_collect_known_conflicts "unreachable"
+        diag_print_summary
+        echo ""
+        echo "Core:"
+        echo "  RPC Endpoint:               ${DIAG_RPC_URL}"
+        echo "  Pod RPC:                    $(diag_status_label ERROR) unreachable"
+        echo ""
+        diag_print_component_status "unreachable"
+        echo ""
+        echo "Required Port Listener Check:"
+        printf '%s\n' "${DIAG_PORT_CHECK_LINES[@]}"
+        diag_print_ufw_context_if_inactive
+        echo ""
+        echo "Known Conflicts:"
+        printf '%s\n' "${DIAG_KNOWN_CONFLICT_LINES[@]}"
+        echo "Evidence:"
+        printf '  %s\n' "${DIAG_KNOWN_CONFLICT_EVIDENCE[@]}"
+        echo ""
+        echo "No diagnostic changes were made."
+        echo "================================================================="
+        return 0
+    fi
+
+    diag_print_reachable_node_report
+
+    echo ""
+    echo "No diagnostic changes were made."
+    echo "================================================================="
+
+    return 0
+}
+
+diag_have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+diag_status_label() {
+    case "$1" in
+        PASS)  printf "[PASS]" ;;
+        INFO)  printf "[INFO]" ;;
+        WARN)  printf "[WARN]" ;;
+        FAIL)  printf "[FAIL]" ;;
+        ERROR) printf "[ERROR]" ;;
+        *)     printf "[%s]" "$1" ;;
+    esac
+}
+
+diag_add_alert() {
+    local level="$1"
+    shift
+    local text="$*"
+
+    case "$level" in
+        PASS) DIAG_PASS_COUNT=$((DIAG_PASS_COUNT + 1)) ;;
+        INFO) DIAG_INFO_COUNT=$((DIAG_INFO_COUNT + 1)) ;;
+        WARN) DIAG_WARN_COUNT=$((DIAG_WARN_COUNT + 1)) ;;
+        FAIL) DIAG_FAIL_COUNT=$((DIAG_FAIL_COUNT + 1)) ;;
+        ERROR) DIAG_ERROR_COUNT=$((DIAG_ERROR_COUNT + 1)) ;;
+    esac
+
+    if [ "$level" != "PASS" ] && [ "$level" != "INFO" ]; then
+        DIAG_ALERT_LINES+=("$(diag_status_label "$level") ${text}")
+    fi
+}
+
+diag_print_summary() {
+    local overall="PASS"
+    local text="Node diagnostic completed"
+    local alert_line
+
+    if [ "$DIAG_ERROR_COUNT" -gt 0 ]; then
+        overall="ERROR"
+        text="Check could not complete cleanly"
+    elif [ "$DIAG_FAIL_COUNT" -gt 0 ]; then
+        overall="FAIL"
+        text="Node has failing checks"
+    elif [ "$DIAG_WARN_COUNT" -gt 0 ]; then
+        overall="WARN"
+        text="Node running with issues to review"
+    fi
+
+    echo "+--------------------------------------------------+"
+    echo "|          XANDEUM NODE DIAGNOSTIC                 |"
+    echo "+--------------------------------------------------+"
+    echo "  Source:                     installer built-in"
+    echo "  Overall:                    $(diag_status_label "$overall") ${text}"
+    echo "  Alerts:                     ${DIAG_FAIL_COUNT} FAIL, ${DIAG_WARN_COUNT} WARN, ${DIAG_ERROR_COUNT} ERROR"
+    if [ "${#DIAG_ALERT_LINES[@]}" -gt 0 ]; then
+        echo ""
+        echo "  Attention Needed:"
+        for alert_line in "${DIAG_ALERT_LINES[@]}"; do
+            echo "    ${alert_line}"
+        done
+    fi
+    echo "+--------------------------------------------------+"
+}
+
+diag_ss_lines_for_port() {
+    local proto="$1"
+    local port="$2"
+    local flags="-ltnp"
+
+    if [ "$proto" = "udp" ]; then
+        flags="-lunp"
+    fi
+
+    if diag_have_cmd ss; then
+        ss -H ${flags} 2>/dev/null | awk -v target="$port" '
+          {
+            local_addr = $4
+            n = split(local_addr, parts, ":")
+            local_port = parts[n]
+            sub(/[^0-9].*$/, "", local_port)
+            if (local_port == target) print
+          }
+        ' || true
+    fi
+}
+
+diag_owner_hint_from_lines() {
+    local lines="$1"
+
+    if [ -z "$lines" ]; then
+        echo "none"
+    elif echo "$lines" | grep -Eqi 'users:\(\("pod"|/pod([[:space:],)]|$)|\bpod\b'; then
+        echo "pod-like"
+    elif echo "$lines" | grep -Eqi 'pod-manager|pod-man|MainThread|node.*pod-man|/root/pod-man'; then
+        echo "pod-manager-like"
+    elif echo "$lines" | grep -Eqi 'sshd|ssh'; then
+        echo "ssh-like"
+    else
+        echo "unexpected-or-unknown"
+    fi
+}
+
+diag_get_pod_manager_port_hint() {
+    local cfg="/root/pod-man/config.json"
+    local pm_port=""
+
+    if [ ! -f "$cfg" ]; then
+        echo ""
+        return
+    fi
+
+    if diag_have_cmd jq; then
+        pm_port=$(jq -r '.. | objects | to_entries[]? | select((.key|test("port|listen|server"; "i")) and (.value|type=="number" or type=="string")) | .value' "$cfg" 2>/dev/null | grep -E '^[0-9]+$' | head -n 1 || true)
+    fi
+
+    if [ -z "$pm_port" ]; then
+        pm_port=$(grep -Eoi '"[^"]*(port|listen|server)[^"]*"[[:space:]]*:[[:space:]]*"?[0-9]+"?' "$cfg" 2>/dev/null | grep -Eo '[0-9]+' | head -n 1 || true)
+    fi
+
+    echo "$pm_port"
+}
+
+diag_classify_listener() {
+    local port="$1"
+    local proto="$2"
+    local purpose="$3"
+    local owner="$4"
+    local pod_rpc_state="$5"
+
+    if [ "$pod_rpc_state" != "reachable" ]; then
+        if [ "$port" = "7000" ]; then
+            if [ "$owner" = "pod-like" ]; then
+                echo "INFO|${port}/${proto} ${purpose}: pod-like listener found, but pod RPC is not reachable"
+            elif [ "$owner" = "pod-manager-like" ]; then
+                echo "FAIL|${port}/${proto} ${purpose}: held by pod-manager-like process while pod RPC is unreachable"
+            elif [ "$owner" = "none" ]; then
+                echo "INFO|${port}/${proto} ${purpose}: no listener detected; pod appears down, root cause not confirmed"
+            else
+                echo "FAIL|${port}/${proto} ${purpose}: held by ${owner} while pod RPC is unreachable"
+            fi
+        else
+            if [ "$owner" = "pod-like" ]; then
+                echo "INFO|${port}/${proto} ${purpose}: pod-like listener found, but pod RPC is not reachable"
+            elif [ "$owner" = "none" ]; then
+                echo "INFO|${port}/${proto} ${purpose}: no listener detected because pod appears down"
+            else
+                echo "INFO|${port}/${proto} ${purpose}: listener is ${owner}; pod appears down, treat as context not root cause"
+            fi
+        fi
+        return
+    fi
+
+    if [ "$owner" = "pod-like" ]; then
+        echo "PASS|${port}/${proto} ${purpose}: pod-like listener found"
+    elif [ "$owner" = "none" ]; then
+        if [ "$port" = "7001" ]; then
+            echo "INFO|${port}/${proto} ${purpose}: no listener detected; outbound-only listener may be version-dependent"
+        else
+            echo "WARN|${port}/${proto} ${purpose}: no listener detected"
+        fi
+    else
+        echo "WARN|${port}/${proto} ${purpose}: listener is ${owner}, not clearly pod-like"
+    fi
+}
+
+diag_collect_required_port_checks() {
+    local pod_rpc_state="$1"
+    local row port rest proto purpose lines owner result level msg
+
+    DIAG_PORT_CHECK_LINES=()
+    DIAG_PORT_EVIDENCE_LINES=()
+
+    for row in \
+        "5000|udp|Atlas" \
+        "9001|udp|Gossip" \
+        "6000|tcp|pRPC" \
+        "7000|tcp|Ingest/Tap" \
+        "7001|udp|outbound pod-to-pod fanout" \
+        "7002|udp|inbound pod-to-pod fanout"
+    do
+        port="${row%%|*}"
+        rest="${row#*|}"
+        proto="${rest%%|*}"
+        purpose="${rest#*|}"
+        lines="$(diag_ss_lines_for_port "$proto" "$port")"
+        owner="$(diag_owner_hint_from_lines "$lines")"
+        result="$(diag_classify_listener "$port" "$proto" "$purpose" "$owner" "$pod_rpc_state")"
+        level="${result%%|*}"
+        msg="${result#*|}"
+        DIAG_PORT_CHECK_LINES+=("  $(diag_status_label "$level") ${msg}")
+        if [ "$level" = "WARN" ] || [ "$level" = "FAIL" ]; then
+            diag_add_alert "$level" "$msg"
+        fi
+        if [ -n "$lines" ]; then
+            DIAG_PORT_EVIDENCE_LINES+=("${port}/${proto}: ${lines}")
+        else
+            DIAG_PORT_EVIDENCE_LINES+=("${port}/${proto}: no listener detected")
+        fi
+    done
+}
+
+diag_collect_known_conflicts() {
+    local pod_rpc_state="$1"
+    local lines owner pm_port level msg
+
+    DIAG_KNOWN_CONFLICT_LINES=()
+    DIAG_KNOWN_CONFLICT_EVIDENCE=()
+
+    lines="$(diag_ss_lines_for_port tcp 7000)"
+    owner="$(diag_owner_hint_from_lines "$lines")"
+    pm_port="$(diag_get_pod_manager_port_hint)"
+
+    if [ "$owner" = "pod-like" ]; then
+        if [ "$pm_port" = "7000" ]; then
+            level="WARN"
+            msg="pod owns 7000/tcp, but pod-manager config also references 7000/tcp; restart order may affect pod or pod-manager"
+        else
+            level="PASS"
+            msg="7000/tcp listener appears pod-like"
+        fi
+    elif [ "$owner" = "pod-manager-like" ]; then
+        if [ "$pod_rpc_state" = "reachable" ]; then
+            level="WARN"
+            msg="7000/tcp is held by a pod-manager-like process while pod RPC is reachable; pod or pod-manager may be affected depending on bind order"
+        else
+            level="FAIL"
+            msg="Pod RPC is unreachable and 7000/tcp is held by a pod-manager-like process; likely local port conflict"
+        fi
+    elif [ "$owner" = "none" ]; then
+        if [ "$pod_rpc_state" = "reachable" ]; then
+            level="WARN"
+            msg="No listener detected on 7000/tcp even though pod RPC is reachable"
+        else
+            level="INFO"
+            msg="No listener detected on 7000/tcp; pod RPC is unreachable, root cause not confirmed"
+        fi
+    else
+        if [ "$pod_rpc_state" = "reachable" ]; then
+            level="WARN"
+            msg="7000/tcp is occupied by a process that is not clearly pod-like"
+        else
+            level="FAIL"
+            msg="Pod RPC is unreachable and 7000/tcp is occupied by an unexpected process; likely local port bind conflict"
+        fi
+    fi
+
+    DIAG_KNOWN_CONFLICT_LINES+=("  $(diag_status_label "$level") ${msg}")
+    if [ "$level" = "WARN" ] || [ "$level" = "FAIL" ]; then
+        diag_add_alert "$level" "$msg"
+    fi
+    if [ -n "$lines" ]; then
+        DIAG_KNOWN_CONFLICT_EVIDENCE+=("7000/tcp listener: ${lines}")
+    else
+        DIAG_KNOWN_CONFLICT_EVIDENCE+=("7000/tcp listener: none detected")
+    fi
+    if [ -n "$pm_port" ]; then
+        DIAG_KNOWN_CONFLICT_EVIDENCE+=("pod-manager config port hint: ${pm_port} (/root/pod-man/config.json)")
+    fi
+}
+
+diag_json_value() {
+    local key="$1"
+
+    if diag_have_cmd jq; then
+        printf '%s' "$DIAG_STATS" | jq -r --arg key "$key" '
+          .. | objects | select(has($key)) | .[$key] |
+          select(type == "number" or type == "string")
+        ' 2>/dev/null | head -n 1
+        return
+    fi
+
+    if diag_have_cmd python3; then
+        printf '%s' "$DIAG_STATS" | python3 -c '
+import json
+import sys
+
+key = sys.argv[1]
+
+def walk(value):
+    if isinstance(value, dict):
+        if key in value:
+            yield value[key]
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+for found in walk(data):
+    if isinstance(found, (int, float, str)):
+        print(found)
+        break
+' "$key" 2>/dev/null
+        return
+    fi
+
+    printf '%s\n' "$DIAG_STATS" |
+        grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"\\{0,1\\}[0-9.]*\"\\{0,1\\}" |
+        head -n 1 |
+        sed 's/.*:[[:space:]]*"\{0,1\}\([0-9.]*\)"\{0,1\}$/\1/' || true
+}
+
+diag_json_number() {
+    diag_json_value "$1" | grep -E '^[0-9]+([.][0-9]+)?$' | head -n 1 || true
+}
+
+diag_find_executable() {
+    local cmd_name="$1"
+    shift
+    local candidate
+
+    if command -v "$cmd_name" >/dev/null 2>&1; then
+        command -v "$cmd_name"
+        return
+    fi
+
+    for candidate in "$@"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+
+    echo ""
+}
+
+diag_version_from_executable() {
+    local exe="$1"
+    local version=""
+
+    if [ -z "$exe" ]; then
+        echo "version unknown"
+        return
+    fi
+
+    version=$("$exe" --version 2>/dev/null | head -n 1 || true)
+    [ -n "$version" ] && echo "$version" || echo "installed, version unknown"
+}
+
+diag_process_status() {
+    local pattern="$1"
+    local service_name="$2"
+    local proc_count="0"
+
+    if diag_have_cmd systemctl && systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        echo "active service"
+        return
+    fi
+
+    if diag_have_cmd pgrep; then
+        if [ "$service_name" = "xandminer" ] || [ "$service_name" = "xandminerd" ] || [ "$service_name" = "pod" ]; then
+            proc_count=$(pgrep -x "$service_name" 2>/dev/null | wc -l | tr -d ' ')
+        else
+            proc_count=$(pgrep -af "$pattern" 2>/dev/null | grep -Ev 'pgrep|install.sh' | wc -l | tr -d ' ')
+        fi
+        if [[ "$proc_count" =~ ^[0-9]+$ && "$proc_count" -gt 0 ]]; then
+            echo "running"
+            return
+        fi
+    fi
+
+    echo "not detected"
+}
+
+diag_component_status_label() {
+    local status="${1:-}"
+
+    if [ "$status" = "reachable" ] || [ "$status" = "active service" ] || [ "$status" = "running" ]; then
+        diag_status_label PASS
+    else
+        diag_status_label WARN
+    fi
+}
+
+diag_detect_network() {
+    local evidence=""
+    local selected="unknown"
+    local systemd_text=""
+    local process_text=""
+    local apt_text=""
+
+    if diag_have_cmd systemctl; then
+        systemd_text=$(systemctl cat pod.service xandminerd.service xandminer.service 2>/dev/null || true)
+    fi
+    process_text=$(ps -eo args 2>/dev/null | grep -Ei 'pod|xandminer|xandminerd|devnet|trynet|mainnet|atlas' | grep -v grep || true)
+    apt_text=$(find /etc/apt/sources.list.d -maxdepth 1 -type f -iname '*xandeum*' -print 2>/dev/null || true)
+
+    if echo "$systemd_text" | grep -Eqi -- '--devnet|devnet'; then selected="devnet"; evidence="systemd pod service"
+    elif echo "$systemd_text" | grep -Eqi -- '--trynet|trynet|try-net'; then selected="trynet"; evidence="systemd pod service"
+    elif echo "$systemd_text" | grep -Eqi -- '--mainnet|mainnet-alpha|mainnet'; then selected="mainnet"; evidence="systemd pod service"
+    elif echo "$process_text" | grep -Eqi -- '--devnet|devnet'; then selected="devnet"; evidence="running process"
+    elif echo "$process_text" | grep -Eqi -- '--trynet|trynet|try-net'; then selected="trynet"; evidence="running process"
+    elif echo "$process_text" | grep -Eqi -- '--mainnet|mainnet-alpha|mainnet'; then selected="mainnet"; evidence="running process"
+    elif echo "$apt_text" | grep -qi 'devnet'; then selected="devnet"; evidence="apt source"
+    elif echo "$apt_text" | grep -Eqi 'trynet|try-net'; then selected="trynet"; evidence="apt source"
+    elif echo "$apt_text" | grep -Eqi 'mainnet|mainnet-alpha'; then selected="mainnet"; evidence="apt source"
+    fi
+
+    echo "${selected}|${evidence}"
+}
+
+diag_find_pod_public_key() {
+    local path_hint=""
+    local key=""
+    local candidate
+
+    if diag_have_cmd systemctl; then
+        path_hint=$(systemctl cat xandminerd.service pod.service 2>/dev/null | grep -oE 'PNODE_KEYPAIR_PATH=[^[:space:]]+' | head -n 1 | cut -d= -f2- || true)
+    fi
+
+    for candidate in "$path_hint" "/local/keypairs/pnode-keypair.json" "/root/xandminerd/keypairs/pnode-keypair.json" "/root/pod-man/config.json"; do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            key=$(grep -oE '"publicKey"[[:space:]]*:[[:space:]]*"[^"]+"' "$candidate" 2>/dev/null | head -n 1 | sed 's/.*"publicKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+            if [ -n "$key" ]; then
+                echo "${key}|${candidate}"
+                return
+            fi
+        fi
+    done
+
+    echo "|"
+}
+
+diag_format_seconds() {
+    local seconds="${1:-}"
+    local days hours minutes
+
+    if ! [[ "$seconds" =~ ^[0-9]+$ ]]; then echo "unknown"; return; fi
+    days=$((seconds / 86400))
+    hours=$(((seconds % 86400) / 3600))
+    minutes=$(((seconds % 3600) / 60))
+    if [ "$days" -gt 0 ]; then echo "${seconds} sec (${days}d ${hours}h ${minutes}m)"
+    elif [ "$hours" -gt 0 ]; then echo "${seconds} sec (${hours}h ${minutes}m)"
+    else echo "${seconds} sec (${minutes}m)"
+    fi
+}
+
+diag_format_bytes() {
+    local bytes="${1:-}"
+
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then echo "unknown"; return; fi
+    if [ "$bytes" -ge 1000000000000 ]; then awk -v b="$bytes" 'BEGIN { printf "%d bytes (%.2f TB)", b, b/1000000000000 }'
+    elif [ "$bytes" -ge 1000000000 ]; then awk -v b="$bytes" 'BEGIN { printf "%d bytes (%.2f GB)", b, b/1000000000 }'
+    elif [ "$bytes" -ge 1000000 ]; then awk -v b="$bytes" 'BEGIN { printf "%d bytes (%.2f MB)", b, b/1000000 }'
+    elif [ "$bytes" -ge 1000 ]; then awk -v b="$bytes" 'BEGIN { printf "%d bytes (%.2f KB)", b, b/1000 }'
+    else echo "${bytes} bytes"
+    fi
+}
+
+diag_format_timestamp() {
+    local ts="${1:-}"
+
+    if ! [[ "$ts" =~ ^[0-9]+$ ]]; then echo "unknown"; return; fi
+    if date -d "@${ts}" '+%Y-%m-%d %H:%M:%S %Z' >/dev/null 2>&1; then
+        date -d "@${ts}" '+%Y-%m-%d %H:%M:%S %Z'
+    else
+        echo "${ts}"
+    fi
+}
+
+diag_format_percent() {
+    local value="${1:-}"
+
+    if [ -z "$value" ]; then
+        echo "unknown"
+    else
+        awk -v v="$value" 'BEGIN { printf "%.2f%%", v }' 2>/dev/null || echo "$value"
+    fi
+}
+
+diag_format_ratio_percent() {
+    local n="${1:-}"
+    local d="${2:-}"
+
+    if ! [[ "$n" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || [ "$d" -eq 0 ]; then
+        echo "unknown"
+    else
+        awk -v n="$n" -v d="$d" 'BEGIN { printf "%.4f%%", (n/d)*100 }'
+    fi
+}
+
+diag_print_component_status() {
+    local pod_status="${1:-reachable}"
+    local pod_exe xandminer_exe xandminerd_exe
+    local pod_version xandminer_version xandminerd_version
+    local xandminer_status xandminerd_status
+
+    pod_exe=$(diag_find_executable "pod" "/usr/local/bin/pod" "/root/pod" "/root/pod-man/pod")
+    xandminer_exe=$(diag_find_executable "xandminer" "/usr/local/bin/xandminer" "/root/xandminer/xandminer" "/root/xandminer/target/release/xandminer")
+    xandminerd_exe=$(diag_find_executable "xandminerd" "/usr/local/bin/xandminerd" "/root/xandminerd/xandminerd" "/root/xandminerd/target/release/xandminerd")
+    pod_version=$(diag_version_from_executable "$pod_exe")
+    xandminer_version=$(diag_version_from_executable "$xandminer_exe")
+    xandminerd_version=$(diag_version_from_executable "$xandminerd_exe")
+
+    if [ "$pod_status" = "unreachable" ]; then
+        pod_status=$(diag_process_status "pod" "pod")
+    fi
+    xandminer_status=$(diag_process_status "xandminer" "xandminer")
+    xandminerd_status=$(diag_process_status "xandminerd" "xandminerd")
+
+    echo "Component Status:"
+    printf "  %-14s %-9s %-18s %s\n" "pod:" "$(diag_component_status_label "$pod_status")" "$pod_status" "$pod_version"
+    printf "  %-14s %-9s %-18s %s\n" "xandminer:" "$(diag_component_status_label "$xandminer_status")" "$xandminer_status" "$xandminer_version"
+    printf "  %-14s %-9s %-18s %s\n" "xandminerd:" "$(diag_component_status_label "$xandminerd_status")" "$xandminerd_status" "$xandminerd_version"
+}
+
+diag_print_ufw_context_if_inactive() {
+    local ufw_status
+    local ufw_status_rc
+
+    if ! diag_have_cmd ufw; then
+        echo "----------------------------------------------------"
+        echo "  Firewall/UFW Context:"
+        echo "    $(diag_status_label INFO) UFW is not installed, so UFW is not filtering ports on this host."
+        echo "    $(diag_status_label INFO) Public access can still be blocked by provider firewalls, security groups, NAT, or router rules."
+        return
+    fi
+
+    ufw_status=$(ufw status verbose 2>&1)
+    ufw_status_rc=$?
+    if [ "$ufw_status_rc" -ne 0 ]; then
+        return
+    fi
+
+    if ! printf '%s\n' "$ufw_status" | grep -q '^Status: active'; then
+        echo "----------------------------------------------------"
+        echo "  Firewall/UFW Context:"
+        echo "    $(diag_status_label INFO) UFW is inactive, so UFW is not filtering ports on this host right now."
+        echo "    $(diag_status_label INFO) Required Xandeum ports are not blocked by UFW while it is inactive."
+        echo "    $(diag_status_label INFO) Public access can still be blocked by provider firewalls, security groups, NAT, or router rules."
+        echo "    $(diag_status_label INFO) Add the Xandeum and SSH allow/limit rules before enabling UFW."
+    fi
+}
+
+diag_print_reachable_node_report() {
+    local pages index active_streams cpu_percent packets_received packets_sent packet_total
+    local ram_total ram_used total_bytes file_size uptime stats_version last_updated
+    local pod_exe pod_version network_result network network_evidence
+    local pod_key_result pod_public_key pod_public_key_source
+    local ram_line="unknown" ram_percent="unknown" storage_capacity_line="unknown"
+    local total_bytes_line="unknown" storage_used_percent="unknown" uptime_line="unknown"
+    local last_updated_line="unknown"
+
+    pages=$(diag_json_number "total_pages")
+    index=$(diag_json_number "current_index")
+    active_streams=$(diag_json_number "active_streams")
+    cpu_percent=$(diag_json_number "cpu_percent")
+    packets_received=$(diag_json_number "packets_received")
+    packets_sent=$(diag_json_number "packets_sent")
+    ram_total=$(diag_json_number "ram_total")
+    ram_used=$(diag_json_number "ram_used")
+    total_bytes=$(diag_json_number "total_bytes")
+    file_size=$(diag_json_number "file_size")
+    uptime=$(diag_json_number "uptime")
+    stats_version=$(diag_json_number "version")
+    last_updated=$(diag_json_number "last_updated")
+
+    if [ -z "${pages:-}" ] || [ -z "${index:-}" ]; then
+        diag_add_alert ERROR "Pod RPC responded, but expected total_pages/current_index fields were not found"
+        diag_collect_required_port_checks "unreachable"
+        diag_collect_known_conflicts "unreachable"
+        diag_print_summary
+        echo "Raw response:"
+        echo "$DIAG_STATS"
+        return
+    fi
+
+    pod_exe=$(diag_find_executable "pod" "/usr/local/bin/pod" "/root/pod" "/root/pod-man/pod")
+    pod_version=$(diag_version_from_executable "$pod_exe")
+    network_result=$(diag_detect_network)
+    network="${network_result%%|*}"
+    network_evidence="${network_result#*|}"
+    pod_key_result=$(diag_find_pod_public_key)
+    pod_public_key="${pod_key_result%%|*}"
+    pod_public_key_source="${pod_key_result#*|}"
+
+    diag_collect_required_port_checks "reachable"
+    diag_collect_known_conflicts "reachable"
+
+    if [ -n "${ram_used:-}" ] && [ -n "${ram_total:-}" ]; then
+        ram_line="$(diag_format_bytes "$ram_used") / $(diag_format_bytes "$ram_total")"
+        ram_percent="$(diag_format_ratio_percent "$ram_used" "$ram_total")"
+    fi
+    [ -n "${file_size:-}" ] && storage_capacity_line="$(diag_format_bytes "$file_size")"
+    [ -n "${total_bytes:-}" ] && total_bytes_line="$(diag_format_bytes "$total_bytes")"
+    if [ -n "${total_bytes:-}" ] && [ -n "${file_size:-}" ]; then
+        storage_used_percent="$(diag_format_ratio_percent "$total_bytes" "$file_size")"
+    fi
+    [ -n "${uptime:-}" ] && uptime_line="$(diag_format_seconds "$uptime")"
+    [ -n "${last_updated:-}" ] && last_updated_line="$(diag_format_timestamp "$last_updated")"
+    packet_total="unknown"
+    if [[ "${packets_received:-}" =~ ^[0-9]+$ && "${packets_sent:-}" =~ ^[0-9]+$ ]]; then
+        packet_total=$((packets_received + packets_sent))
+    fi
+
+    diag_print_summary
+
+    echo ""
+    echo "Core:"
+    echo "  RPC Endpoint:               ${DIAG_RPC_URL}"
+    echo "  Pod RPC:                    $(diag_status_label PASS) reachable"
+    echo "  Pod Command Version:        ${pod_version}"
+    echo "  Network:                    $(diag_status_label INFO) ${network}"
+    if [ -n "$network_evidence" ] && [ "$network_evidence" != "$network" ]; then
+        echo "  Network Evidence:           ${network_evidence}"
+    fi
+    if [ -n "$pod_public_key" ]; then
+        echo "  Local pNode Public Key:     $(diag_status_label PASS) ${pod_public_key}"
+        [ -n "$pod_public_key_source" ] && echo "  Public Key Source:          ${pod_public_key_source}"
+    else
+        echo "  Local pNode Public Key:     $(diag_status_label WARN) not found safely"
+    fi
+    echo "  Credits Status:             $(diag_status_label INFO) skipped by installer local diagnostic"
+    echo "  Pod Stats Version:          ${stats_version:-unknown}"
+    echo "  Last Updated:               ${last_updated_line}"
+
+    echo "----------------------------------------------------"
+    diag_print_component_status "reachable"
+
+    echo "----------------------------------------------------"
+    echo "  Required Port Listener Check:"
+    printf '%s\n' "${DIAG_PORT_CHECK_LINES[@]}"
+
+    diag_print_ufw_context_if_inactive
+
+    echo "----------------------------------------------------"
+    echo "  Known Conflicts:"
+    printf '%s\n' "${DIAG_KNOWN_CONFLICT_LINES[@]}"
+    echo "  Evidence:"
+    printf '    %s\n' "${DIAG_KNOWN_CONFLICT_EVIDENCE[@]}"
+
+    echo "----------------------------------------------------"
+    echo "  Total Storage Pages Loaded: ${pages}"
+    echo "  Current Storage Index:      ${index}"
+    echo "  Total Bytes Reported:       ${total_bytes_line}"
+    echo "  File Size / Capacity:       ${storage_capacity_line}"
+    echo "  Storage Used:               ${storage_used_percent}"
+    echo "----------------------------------------------------"
+    echo "  Active Streams:             ${active_streams:-unknown}"
+    echo "  Packets Received:           ${packets_received:-unknown}"
+    echo "  Packets Sent:               ${packets_sent:-unknown}"
+    echo "  Packet Total:               ${packet_total}"
+    echo "----------------------------------------------------"
+    echo "  CPU Percent:                $(diag_format_percent "${cpu_percent:-}")"
+    echo "  RAM Used / Total:           ${ram_line}"
+    echo "  RAM Used Percent:           ${ram_percent}"
+    echo "  Uptime:                     ${uptime_line}"
+    echo "----------------------------------------------------"
+    if [ "$pages" -gt 0 ]; then
+        echo "  STATUS: Running as a [STORAGE PROVIDER]"
+        echo "  Your node is actively writing ledger data."
+    else
+        echo "  STATUS: Running as a [COMPUTE VALIDATOR]"
+        echo "  Your node is validating transactions in RAM."
+    fi
 }
 
 detect_configured_ssh_port() {
@@ -327,7 +1068,11 @@ add_firewall_rule_check() {
     if ufw_rule_present "$pattern"; then
         printf '  [PASS] %-36s present\n' "$label"
     else
-        printf '  [WARN] %-36s missing\n' "$label"
+        if [ "$FIREWALL_UFW_ACTIVE" = "true" ]; then
+            printf '  [WARN] %-36s missing\n' "$label"
+        else
+            printf '  [INFO] %-36s needed before enabling UFW\n' "$label"
+        fi
         FIREWALL_MISSING_COMMANDS+=("$command_hint")
     fi
 }
@@ -340,10 +1085,18 @@ add_firewall_ssh_check() {
     if ufw_rule_present "$limit_pattern"; then
         printf '  [PASS] %-36s rate-limited\n' "SSH ${ssh_port}/tcp inbound"
     elif ufw_rule_present "$allow_pattern"; then
-        printf '  [WARN] %-36s allowed, but not rate-limited\n' "SSH ${ssh_port}/tcp inbound"
+        if [ "$FIREWALL_UFW_ACTIVE" = "true" ]; then
+            printf '  [WARN] %-36s allowed, but not rate-limited\n' "SSH ${ssh_port}/tcp inbound"
+        else
+            printf '  [INFO] %-36s rate-limit recommended before enabling UFW\n' "SSH ${ssh_port}/tcp inbound"
+        fi
         FIREWALL_MISSING_COMMANDS+=("sudo ufw limit ${ssh_port}/tcp comment 'SSH access with UFW rate limiting'")
     else
-        printf '  [WARN] %-36s missing rate-limit rule\n' "SSH ${ssh_port}/tcp inbound"
+        if [ "$FIREWALL_UFW_ACTIVE" = "true" ]; then
+            printf '  [WARN] %-36s missing rate-limit rule\n' "SSH ${ssh_port}/tcp inbound"
+        else
+            printf '  [INFO] %-36s needed before enabling UFW\n' "SSH ${ssh_port}/tcp inbound"
+        fi
         FIREWALL_MISSING_COMMANDS+=("sudo ufw limit ${ssh_port}/tcp comment 'SSH access with UFW rate limiting'")
     fi
 }
@@ -371,6 +1124,7 @@ firewall_ufw_report() {
     ufw_status_rc=$?
     ssh_port="$(detect_configured_ssh_port)"
     FIREWALL_MISSING_COMMANDS=()
+    FIREWALL_UFW_ACTIVE=false
 
     if [ "$ufw_status_rc" -ne 0 ]; then
         echo "[WARN] Could not read UFW status cleanly."
@@ -380,9 +1134,14 @@ firewall_ufw_report() {
     fi
 
     if printf '%s\n' "$UFW_STATUS_VERBOSE" | grep -q '^Status: active'; then
+        FIREWALL_UFW_ACTIVE=true
         echo "[PASS] UFW status: active"
     else
         echo "[WARN] UFW status is not active."
+        echo "[INFO] UFW is not filtering traffic on this host right now."
+        echo "[INFO] Required Xandeum ports are not blocked by UFW while it is inactive."
+        echo "[INFO] Public access can still be blocked by provider firewalls, security groups, NAT, or router rules."
+        echo "[INFO] If you plan to enable UFW, add or verify the Xandeum and SSH rules first."
     fi
 
     if printf '%s\n' "$UFW_STATUS_VERBOSE" | grep -q '^Default:'; then
@@ -397,7 +1156,11 @@ firewall_ufw_report() {
     echo "-----------------------------------------------------------------"
     echo ""
 
-    echo "Expected Xandeum firewall profile:"
+    if [ "$FIREWALL_UFW_ACTIVE" = "true" ]; then
+        echo "Expected Xandeum firewall profile:"
+    else
+        echo "Expected Xandeum firewall profile before enabling UFW:"
+    fi
     add_firewall_rule_check "5000/udp inbound Atlas" '^5000/udp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 5000/udp comment 'Atlas'"
     add_firewall_rule_check "9001/udp inbound Gossip" '^9001/udp[[:space:]]+ALLOW IN([[:space:]]|$)' "sudo ufw allow 9001/udp comment 'Gossip inbound'"
     add_firewall_rule_check "9001/udp outbound Gossip" '^9001/udp[[:space:]]+ALLOW OUT([[:space:]]|$)' "sudo ufw allow out 9001/udp comment 'Gossip outbound'"
@@ -412,12 +1175,22 @@ firewall_ufw_report() {
     if [ "${#FIREWALL_MISSING_COMMANDS[@]}" -eq 0 ]; then
         echo "[PASS] No missing Xandeum firewall rules detected."
     else
-        echo "[WARN] Missing or incomplete firewall entries detected."
-        echo "Commands that would address the report, shown for review only:"
+        if [ "$FIREWALL_UFW_ACTIVE" = "true" ]; then
+            echo "[WARN] Missing or incomplete firewall entries detected."
+            echo "Commands that would address the report, shown for review only:"
+        else
+            echo "[INFO] UFW is inactive, so these missing rules are not current UFW blocks."
+            echo "[WARN] Before enabling UFW, review/apply these rules first to avoid blocking Xandeum or SSH."
+            echo "Preflight commands for enabling UFW later, shown for review only:"
+        fi
         local command_hint
         for command_hint in "${FIREWALL_MISSING_COMMANDS[@]}"; do
             printf '  %s\n' "$command_hint"
         done
+        if [ "$FIREWALL_UFW_ACTIVE" != "true" ]; then
+            echo "After the required rules are in place, UFW can be enabled manually with:"
+            echo "  sudo ufw enable"
+        fi
     fi
 
     echo ""
